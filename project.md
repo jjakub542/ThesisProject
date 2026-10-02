@@ -71,6 +71,35 @@ The wellbore always spans `OUTER_RADIUS_CELLS = 40` cells, so resolution is the 
 
 Because the viscosity and pressure gradient are not parameters, absolute velocities are not shown. Multiply `u*` by `G·R²/μ` for a given fluid.
 
+### 2.2 Wellbore wall friction (formations)
+
+Rough or irregular formations drag on the flow more than a smooth wall does. This is modelled as a thin layer of flow resistance next to the **wellbore wall** (a Darcy–Brinkman term). The drill pipe stays smooth steel.
+
+```
+∇²u − (c/dx²)·u = −G/μ     →     u[i] = (Σ neighbours + f) / (4 + c[i])
+c[i] = WALL_DRAG · coverage[i]
+```
+
+- Layer thickness is the effective roughness `ε = (ε/D) · D`, which is `ε/D · 80` cells, because the wellbore diameter is 80 cells.
+- `coverage[i]` (0..1) is the fraction of cell `i` inside that layer. With `ε/D = 0` every `c` is 0 and the solver reduces to the original stencil.
+- `WALL_DRAG = 2` (`config.ts`) is a tuning constant. It sets how strongly a fully covered cell is slowed.
+- **Reference solve:** while `ε/D > 0` the worker also advances a second `Solver` with the same geometry and smooth walls, until it converges. `RESULT.referenceFlow` carries its flow, and the HUD shows `Q change = flow / referenceFlow − 1` once both solutions have converged. At `ε/D = 0` no reference runs and the HUD says "smooth (reference)".
+
+**Formation presets** (`FORMATIONS` in `config.ts`):
+
+| Formation | ε/D |
+|---|---|
+| Smooth / gauge hole | 0 % |
+| Salt | 0.5 % |
+| Limestone / dolomite | 1 % |
+| Shale | 2 % |
+| Sandstone | 3 % |
+| Unconsolidated sand | 5 % |
+| Fractured / vuggy carbonate | 7 % |
+| Washout / caved zone | 10 % |
+
+These are **effective, illustrative** values that lump micro-roughness and hole irregularity together. They are not measured constants. Calibrate them with caliper logs or measured pressure losses. The model is laminar and Newtonian, so it does not reproduce turbulent roughness correlations (Colebrook and similar).
+
 ## 3. Data flow
 
 ### 3.1 Start-up
@@ -107,7 +136,7 @@ At most one `COMPUTE` is in flight (`computeBusy`). Buffers are transferred, not
 
 1. The user edits a diameter (on change), picks a preset, or drags eccentricity.
 2. `setDiameters` clamps the values (wellbore 3–26 in, pipe 10–90 % of wellbore Ø) and shows a notice if it had to adjust them.
-3. `requestGeometry()` sends `SET_GEOMETRY { diameterRatio, eccentricity }`. While one request is in flight, newer values are coalesced into a single follow-up (`geometryDirty`), so slider drags do not flood the worker.
+3. `requestGeometry()` sends `SET_GEOMETRY { diameterRatio, eccentricity, roughness }`. While one request is in flight, newer values are coalesced into a single follow-up (`geometryDirty`), so slider drags do not flood the worker.
 4. The worker rebuilds the mask, **resets `u` to zero** and replies `GEOMETRY`.
 5. `Visualizer.setGeometry` stores the mask, replaces the velocity with a zero field, so the new walls appear immediately, and rebuilds the tubes. `main.ts` then starts a new solve loop.
 
@@ -117,11 +146,11 @@ Messages are processed in order by the worker, so a `RESULT` can never arrive fo
 
 | Direction | `type` | Payload |
 |---|---|---|
-| main → worker | `INIT` | `{ size, diameterRatio, eccentricity }` |
-| main → worker | `SET_GEOMETRY` | `{ diameterRatio, eccentricity }` |
+| main → worker | `INIT` | `{ size, diameterRatio, eccentricity, roughness }` |
+| main → worker | `SET_GEOMETRY` | `{ diameterRatio, eccentricity, roughness }` (`roughness` = ε/D as a fraction) |
 | main → worker | `COMPUTE` | none |
 | worker → main | `READY` / `GEOMETRY` | `{ mask, radiusOuter, radiusInner, eccentricity }` (radii in cells) |
-| worker → main | `RESULT` | `{ velocity: Float64Array, delta }` |
+| worker → main | `RESULT` | `{ velocity: Float64Array, delta, referenceFlow }` (`delta` is the max of the rough and smooth solves; `referenceFlow` is `null` when ε/D = 0) |
 
 ## 4. Rendering
 
@@ -157,10 +186,13 @@ Two cylinders are built per geometry, one for the wellbore wall (radius `Ro`, ce
 | Wellbore Ø | 3–26 in | Scales `Q`. Changes the shape only through `d/D`. |
 | Drill pipe OD | 10–90 % of wellbore Ø | Changes `d/D` and therefore the shape |
 | Eccentricity | 0–0.95 | Shifts the pipe toward the wall |
+| Formation | Custom + 8 presets | Sets the wall roughness (see 2.2) |
+| Roughness ε/D | 0–15 % | Thickness of the wall resistance layer; lowers Q and flattens the profile near the wall |
 | Drill string / Wellbore | on/off + opacity | See 4.2 |
 
 ## 6. Limitations and ideas
 
+- **Friction model is effective.** Wall friction is a resistance layer with a tuned strength, not a turbulent roughness correlation. Use it to compare formations qualitatively.
 - **Newtonian only.** Real drilling muds are shear-thinning (Bingham or Herschel–Bulkley). A viscosity field `μ(|∇u|)` would fit into the same SOR loop with an outer iteration.
 - **Staircase walls.** Circles are voxelised, so wall shear is approximate. 40 cells per radius is a compromise between speed and accuracy.
 - **No pipe rotation, no axial variation.** Flow is purely axial and fully developed.

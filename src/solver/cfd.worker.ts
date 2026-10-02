@@ -1,10 +1,12 @@
 import { Solver } from './Solver';
-import { OUTER_RADIUS_CELLS } from '../config';
+import { CONVERGENCE_TOL, OUTER_RADIUS_CELLS } from '../config';
 
 interface GeometryPayload {
     /** pipe OD / wellbore diameter */
     diameterRatio: number;
     eccentricity: number;
+    /** wall roughness eps / D (0 = smooth) */
+    roughness: number;
 }
 
 /**
@@ -15,8 +17,31 @@ const ctx = self as unknown as Worker;
 
 let solver: Solver;
 
+/** Same geometry with smooth walls. Only exists while roughness > 0; used to quantify the friction impact. */
+let reference: Solver | null = null;
+let referenceDelta = 0;
+let referenceFlow: number | null = null;
+
+function fluidFlow(s: Solver): number {
+    let sum = 0;
+    for (let i = 0; i < s.geometryMask.length; i++) if (s.geometryMask[i] === 0) sum += s.velocity[i];
+    return sum;
+}
+
 function applyGeometry(p: GeometryPayload) {
-    solver.initGeometry(OUTER_RADIUS_CELLS, OUTER_RADIUS_CELLS * p.diameterRatio, p.eccentricity);
+    const ri = OUTER_RADIUS_CELLS * p.diameterRatio;
+    solver.initGeometry(OUTER_RADIUS_CELLS, ri, p.eccentricity, p.roughness);
+
+    if (p.roughness > 0) {
+        if (!reference) reference = new Solver(solver.size);
+        reference.initGeometry(OUTER_RADIUS_CELLS, ri, p.eccentricity, 0);
+        referenceDelta = Infinity;
+        referenceFlow = null;
+    } else {
+        reference = null;
+        referenceDelta = 0;
+        referenceFlow = null;
+    }
 }
 
 function sendGeometry(type: 'READY' | 'GEOMETRY') {
@@ -48,8 +73,16 @@ self.onmessage = (e) => {
     }
 
     if (type === 'COMPUTE') {
-        const delta = solver.computeStep();
+        let delta = solver.computeStep();
+
+        // Advance the smooth-wall reference until it has converged, then leave it alone.
+        if (reference && referenceDelta > CONVERGENCE_TOL) {
+            referenceDelta = reference.computeStep();
+            referenceFlow = fluidFlow(reference);
+        }
+        delta = Math.max(delta, referenceDelta); // keep the loop running until both are converged
+
         const velocity = new Float64Array(solver.velocity);
-        ctx.postMessage({ type: 'RESULT', velocity, delta }, [velocity.buffer]);
+        ctx.postMessage({ type: 'RESULT', velocity, delta, referenceFlow }, [velocity.buffer]);
     }
 };

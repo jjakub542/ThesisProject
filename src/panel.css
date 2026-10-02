@@ -159,3 +159,17 @@
     opacity: 0.7;
     margin: 0;
 }
+
+/* ---- wall friction ---- */
+#formationNote {
+    font-size: 11px;
+    opacity: 0.75;
+}
+
+#friction {
+    font-size: 12px;
+}
+
+#friction:empty {
+    display: none;
+}

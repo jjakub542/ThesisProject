@@ -37,6 +37,32 @@ export const DEFAULTS = {
     stringOpacity: 0.4,
     showWellbore: true,
     wellboreOpacity: 0.25,
+    /** Effective wall roughness as % of wellbore diameter (0 = smooth reference). */
+    roughnessPct: 0,
 };
 
 export const DEFAULT_RATIO = DEFAULTS.pipeMm / DEFAULTS.wellboreMm;
+
+// ---- wellbore wall friction ----
+/**
+ * Resistance of the wall-roughness layer in cell units: u = (sum(neighbours) + f) / (4 + drag).
+ * A modelling constant: it sets how strongly a fully covered cell is slowed down.
+ */
+export const WALL_DRAG = 2;
+export const MAX_ROUGHNESS_PCT = 15;
+
+/**
+ * Formation presets. `roughnessPct` is an EFFECTIVE roughness (micro-roughness plus hole irregularity)
+ * as % of the wellbore diameter. These are illustrative; calibrate them against caliper logs or
+ * measured pressure losses for your field.
+ */
+export const FORMATIONS = [
+    { label: 'Smooth / gauge hole', roughnessPct: 0, note: 'Reference: cased or perfectly gauged hole, no roughness layer.' },
+    { label: 'Salt', roughnessPct: 0.5, note: 'Plastic and self-healing; usually near-gauge and smooth.' },
+    { label: 'Limestone / dolomite', roughnessPct: 1, note: 'Hard and competent; mild irregularity.' },
+    { label: 'Shale', roughnessPct: 2, note: 'Fissile; sloughing makes the hole slightly irregular.' },
+    { label: 'Sandstone', roughnessPct: 3, note: 'Granular surface with patchy filter cake.' },
+    { label: 'Unconsolidated sand', roughnessPct: 5, note: 'Grains erode; rough, enlarged hole.' },
+    { label: 'Fractured / vuggy carbonate', roughnessPct: 7, note: 'Fractures and vugs add strong wall drag.' },
+    { label: 'Washout / caved zone', roughnessPct: 10, note: 'Severely enlarged, irregular hole.' },
+];

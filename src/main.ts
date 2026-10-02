@@ -5,9 +5,11 @@ import {
     CONVERGENCE_TOL,
     DEFAULTS,
     FORCING_TERM,
+    FORMATIONS,
     GRID_SIZE,
     MAX_DIAMETER_RATIO,
     MAX_ECCENTRICITY,
+    MAX_ROUGHNESS_PCT,
     MIN_DIAMETER_RATIO,
     MM_PER_INCH,
     OUTER_RADIUS_CELLS,
@@ -62,6 +64,20 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     </div>
 
     <div class="group">
+      <h3>Wellbore wall</h3>
+      <label>Formation
+        <select id="formation">
+          <option value="custom">Custom</option>
+          ${FORMATIONS.map((f, i) => `<option value="${i}">${f.label}</option>`).join('')}
+        </select>
+      </label>
+      <label>Roughness ε/D <output id="roughOut"></output>
+        <input id="rough" type="range" min="0" max="${MAX_ROUGHNESS_PCT}" step="0.1" value="${state.roughnessPct}" />
+      </label>
+      <div id="formationNote"></div>
+    </div>
+
+    <div class="group">
       <h3>Layers</h3>
       <div class="layer">
         <div class="head">
@@ -84,6 +100,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <canvas id="legend" width="256" height="1"></canvas>
     <div class="range"><span id="minLabel">0</span><span id="legendTitle"></span><span id="maxLabel"></span></div>
     <div id="flow"></div>
+    <div id="friction"></div>
     <div id="status"></div>
     <p id="note"></p>
   </div>
@@ -117,6 +134,8 @@ const NOTES: Record<ViewMode, string> = {
 };
 
 let lastHud: [Stats, ViewMode] | null = null;
+let converged = false;                  // both the rough and the smooth-wall solution have settled
+let referenceFlow: number | null = null; // smooth-wall flow (cell units); null when roughness = 0
 
 function updateHud(s: Stats, mode: ViewMode) {
     lastHud = [s, mode];
@@ -137,6 +156,16 @@ function updateHud(s: Stats, mode: ViewMode) {
     const qMm4 = (dxMm ** 4 * s.flow) / FORCING_TERM;
     const q = state.unit === 'in' ? qMm4 / MM_PER_INCH ** 4 : qMm4;
     $('flow').textContent = `Q·μ/G = ${q.toPrecision(3)} ${state.unit}⁴`;
+
+    // Friction impact: flow with the rough wall vs. the same geometry with a smooth wall.
+    if (state.roughnessPct <= 0) {
+        $('friction').textContent = 'Wall: smooth (reference)';
+    } else if (converged && referenceFlow && s.flow > 0) {
+        const change = (s.flow / referenceFlow - 1) * 100;
+        $('friction').textContent = `Wall friction: Q ${change.toFixed(1)} % vs smooth wall`;
+    } else {
+        $('friction').textContent = 'Wall friction: solving…';
+    }
     $('note').textContent = NOTES[mode];
 }
 
@@ -153,6 +182,7 @@ let geometryDirty = false;  // newer parameters arrived while it was in flight
 const geometryPayload = () => ({
     diameterRatio: state.pipeMm / state.wellboreMm,
     eccentricity: state.eccentricity,
+    roughness: state.roughnessPct / 100, // eps / D
 });
 
 function requestCompute() {
@@ -164,6 +194,7 @@ function requestCompute() {
 
 /** Coalesces rapid parameter changes (slider drags) into at most one request in flight. */
 function requestGeometry() {
+    converged = false;
     $('status').textContent = 'Solving…';
     if (geometryBusy) {
         geometryDirty = true;
@@ -179,6 +210,7 @@ worker.onmessage = (e) => {
 
     if (type === 'READY' || type === 'GEOMETRY') {
         geometryBusy = false;
+        referenceFlow = null; // belongs to the previous geometry
         visualizer.setGeometry(e.data);
         if (geometryDirty) requestGeometry();
         else requestCompute();
@@ -186,9 +218,11 @@ worker.onmessage = (e) => {
 
     if (type === 'RESULT') {
         computeBusy = false;
-        visualizer.updateData(e.data.velocity);
+        referenceFlow = e.data.referenceFlow;
+        converged = !geometryBusy && e.data.delta <= CONVERGENCE_TOL;
+        visualizer.updateData(e.data.velocity); // HUD refreshes on the next frame and reads `converged`
         if (geometryBusy) return; // stale solve; the GEOMETRY reply restarts it
-        if (e.data.delta > CONVERGENCE_TOL) requestCompute();
+        if (!converged) requestCompute();
         else $('status').textContent = 'Converged ✓';
     }
 };
@@ -226,6 +260,7 @@ function syncGeometryUi(adjusted = false) {
         ? `Adjusted to the allowed range: wellbore Ø ${show(WELLBORE_MIN_MM)}–${show(WELLBORE_MAX_MM)} ${state.unit}, ` +
           `pipe OD ${MIN_DIAMETER_RATIO * 100}–${MAX_DIAMETER_RATIO * 100}% of wellbore Ø.`
         : '';
+    syncWallUi();
 }
 
 function setDiameters(wellboreMm: number, pipeMm: number) {
@@ -269,6 +304,35 @@ $<HTMLInputElement>('ecc').addEventListener('input', (e) => {
 
 $<HTMLSelectElement>('mode').addEventListener('change', (e) => {
     visualizer.setMode((e.target as HTMLSelectElement).value as ViewMode);
+});
+
+// ---- wellbore wall UI (formation presets + roughness) ----
+function matchFormation(): string {
+    const i = FORMATIONS.findIndex((f) => Math.abs(f.roughnessPct - state.roughnessPct) < 0.05);
+    return i >= 0 ? String(i) : 'custom';
+}
+
+function syncWallUi() {
+    const key = matchFormation();
+    const roughMm = (state.wellboreMm * state.roughnessPct) / 100;
+    $<HTMLInputElement>('rough').value = String(state.roughnessPct);
+    $('roughOut').textContent = `${state.roughnessPct.toFixed(1)} % ≈ ${show(roughMm)} ${state.unit}`;
+    $<HTMLSelectElement>('formation').value = key;
+    $('formationNote').textContent = key === 'custom' ? 'Custom effective roughness.' : FORMATIONS[Number(key)].note;
+}
+
+$<HTMLSelectElement>('formation').addEventListener('change', (e) => {
+    const v = (e.target as HTMLSelectElement).value;
+    if (v === 'custom') return;
+    state.roughnessPct = FORMATIONS[Number(v)].roughnessPct;
+    syncWallUi();
+    requestGeometry();
+});
+
+$<HTMLInputElement>('rough').addEventListener('input', (e) => {
+    state.roughnessPct = parseFloat((e.target as HTMLInputElement).value);
+    syncWallUi();
+    requestGeometry();
 });
 
 // ---- layer UI (drill string / wellbore wall) ----
