@@ -2,24 +2,36 @@ import { Solver } from './Solver';
 
 let solver: Solver;
 
-// Nasłuchiwanie komend z głównego wątku
+function sendGeometry(type: 'READY' | 'GEOMETRY') {
+    const mask = solver.geometryMask.slice(); // copy so we can transfer it
+    self.postMessage(
+        {
+            type,
+            mask,
+            radiusOuter: solver.radiusOuter,
+            radiusInner: solver.radiusInner,
+            eccentricity: solver.eccentricity,
+        },
+        [mask.buffer]
+    );
+}
+
 self.onmessage = (e) => {
     const { type, payload } = e.data;
 
     if (type === 'INIT') {
         solver = new Solver(payload.size);
-        self.postMessage({ type: 'READY' });
+        sendGeometry('READY');
+    }
+
+    if (type === 'SET_GEOMETRY') {
+        solver.initGeometry(solver.radiusOuter, solver.radiusInner, payload.eccentricity);
+        sendGeometry('GEOMETRY');
     }
 
     if (type === 'COMPUTE') {
-        solver.computeStep();
-        
-        // Zwracamy tablicę bez kopiowania pamięci (Transferable Object)
-        // Klonujemy tablicę, aby wysłać jej bufor bez utraty referencji w workerze
-        const result = new Float64Array(solver.velocity);
-        self.postMessage(
-            { type: 'RESULT', velocity: result }, 
-            [result.buffer] 
-        );
+        const delta = solver.computeStep();
+        const velocity = new Float64Array(solver.velocity);
+        self.postMessage({ type: 'RESULT', velocity, delta }, [velocity.buffer]);
     }
 };
