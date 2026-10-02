@@ -13,7 +13,13 @@ export interface GeometryInfo {
 export interface Stats {
     min: number;
     max: number;
-    flow: number; // sum of velocity over fluid cells (proportional to flow rate Q)
+    flow: number; // sum of velocity over fluid cells (cell units, proportional to flow rate Q)
+}
+
+/** Visibility + opacity of one 3D layer (drill string or wellbore). */
+export interface LayerStyle {
+    visible: boolean;
+    opacity: number; // 0..1
 }
 
 /** Google "turbo" colormap polynomial approximation, t in [0,1]. */
@@ -41,6 +47,24 @@ export class Visualizer {
 
     private surface!: THREE.Mesh;
     private tubeGroup = new THREE.Group();
+    private wellMesh: THREE.Mesh | null = null; // wellbore wall (outer tube)
+    private pipeMesh: THREE.Mesh | null = null; // drill string (inner tube)
+    private capMeshes: THREE.Mesh[] = [];       // inlet / outlet annulus caps (pressure view only)
+
+    private stringStyle: LayerStyle = { visible: true, opacity: 0.4 };
+    private wellboreStyle: LayerStyle = { visible: true, opacity: 0.25 };
+
+    /**
+     * Each tube has two materials:
+     *  - "Solid": plain silver / brown, used in velocity & shear views so the chart stays readable.
+     *  - "Pressure": vertex-coloured by pressure, used in the pressure view.
+     */
+    private readonly mats = {
+        wellSolid: new THREE.MeshStandardMaterial({ color: 0x8b5a2b, roughness: 0.9, metalness: 0, side: THREE.DoubleSide, transparent: true }),
+        wellPressure: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, side: THREE.BackSide, transparent: true }),
+        pipeSolid: new THREE.MeshStandardMaterial({ color: 0xc8ccd2, roughness: 0.35, metalness: 0.3, side: THREE.DoubleSide, transparent: true }),
+        pipePressure: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, side: THREE.FrontSide, transparent: true }),
+    };
 
     private velocity: Float64Array | null = null;
     private geo: GeometryInfo | null = null;
@@ -85,6 +109,8 @@ export class Visualizer {
 
     public setGeometry(info: GeometryInfo) {
         this.geo = info;
+        // Show the new mask immediately (flat field) instead of mixing it with the old solution.
+        this.velocity = new Float64Array(this.N * this.N);
         this.buildTube();
         this.dirty = true;
     }
@@ -98,6 +124,18 @@ export class Visualizer {
         this.mode = mode;
         this.applyModeVisibility();
         this.dirty = true;
+    }
+
+    /** Drill string (inner tube, silver). */
+    public setStringStyle(style: Partial<LayerStyle>) {
+        Object.assign(this.stringStyle, style);
+        this.applyStyle();
+    }
+
+    /** Wellbore wall (outer tube, brown). */
+    public setWellboreStyle(style: Partial<LayerStyle>) {
+        Object.assign(this.wellboreStyle, style);
+        this.applyStyle();
     }
 
     // ---------- surface chart ----------
@@ -185,18 +223,22 @@ export class Visualizer {
         this.onStats?.({ min: 0, max, flow }, this.mode);
     }
 
-    // ---------- pressure tube ----------
+    // ---------- tubes (drill string + wellbore) ----------
+
+    private disposeTube() {
+        this.tubeGroup.traverse((o) => {
+            if (o instanceof THREE.Mesh) o.geometry.dispose();
+        });
+        this.capMeshes.forEach((c) => (c.material as THREE.Material).dispose()); // caps own their material
+        this.tubeGroup.clear();
+        this.capMeshes = [];
+        this.wellMesh = null;
+        this.pipeMesh = null;
+    }
 
     private buildTube() {
         if (!this.geo) return;
-
-        this.tubeGroup.traverse((o) => {
-            if (o instanceof THREE.Mesh) {
-                o.geometry.dispose();
-                (o.material as THREE.Material).dispose();
-            }
-        });
-        this.tubeGroup.clear();
+        this.disposeTube();
 
         const s = this.worldScale;
         const L = this.tubeLength;
@@ -204,8 +246,9 @@ export class Visualizer {
         const Ri = this.geo.radiusInner * s;
         const offset = this.geo.eccentricity * (this.geo.radiusOuter - this.geo.radiusInner) * s;
 
-        // Color by height: p = 1 at the bottom (inlet), 0 at the top (outlet)
-        const makeCylinder = (radius: number, cx: number, side: THREE.Side) => {
+        // Cylinders span z = 0..L. In chart views they are squashed to chartHeight via mesh.scale.z.
+        // Vertex colours encode pressure: p = 1 at the bottom (inlet), 0 at the top (outlet).
+        const makeCylinder = (radius: number, cx: number, material: THREE.Material) => {
             const g = new THREE.CylinderGeometry(radius, radius, L, 128, 96, true);
             g.rotateX(Math.PI / 2); // axis -> z
             g.translate(cx, 0, L / 2);
@@ -216,35 +259,66 @@ export class Visualizer {
                 colors.set([r, gr, b], i * 3);
             }
             g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-            return new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, side, roughness: 0.5 }));
+            const mesh = new THREE.Mesh(g, material);
+            mesh.renderOrder = 1; // after the opaque chart
+            return mesh;
         };
 
-        this.tubeGroup.add(makeCylinder(Ro, 0, THREE.BackSide));   // borehole wall (seen from inside)
-        this.tubeGroup.add(makeCylinder(Ri, offset, THREE.FrontSide)); // drill pipe
+        this.wellMesh = makeCylinder(Ro, 0, this.mats.wellSolid);
+        this.pipeMesh = makeCylinder(Ri, offset, this.mats.pipeSolid);
+        this.tubeGroup.add(this.wellMesh, this.pipeMesh);
 
-        // Annulus end caps
+        // Annulus end caps (pressure view)
         const shape = new THREE.Shape();
         shape.absarc(0, 0, Ro, 0, Math.PI * 2, false);
         const hole = new THREE.Path();
         hole.absarc(offset, 0, Ri, 0, Math.PI * 2, true);
         shape.holes.push(hole);
 
-        [[0, 1], [L, 0]].forEach(([z, p]) => {
+        const ends: [number, number][] = [[0, 1], [L, 0]];
+        ends.forEach(([z, p]) => {
             const [r, g, b] = turbo(p);
             const cap = new THREE.Mesh(
                 new THREE.ShapeGeometry(shape, 96),
                 new THREE.MeshBasicMaterial({ color: new THREE.Color(r, g, b), side: THREE.DoubleSide })
             );
             cap.position.z = z;
+            this.capMeshes.push(cap);
             this.tubeGroup.add(cap);
         });
+
+        this.applyStyle();
+    }
+
+    /** Pushes mode + layer settings onto the meshes and materials. */
+    private applyStyle() {
+        const pressure = this.mode === 'pressure';
+        const zScale = pressure ? 1 : this.chartHeight / this.tubeLength;
+
+        const layer = (
+            mesh: THREE.Mesh | null,
+            solid: THREE.MeshStandardMaterial,
+            press: THREE.MeshStandardMaterial,
+            style: LayerStyle
+        ) => {
+            solid.opacity = press.opacity = style.opacity;
+            solid.depthWrite = press.depthWrite = style.opacity >= 0.99; // translucent layers must not hide the chart
+            if (!mesh) return;
+            mesh.material = pressure ? press : solid;
+            mesh.visible = style.visible;
+            mesh.scale.z = zScale;
+        };
+
+        layer(this.wellMesh, this.mats.wellSolid, this.mats.wellPressure, this.wellboreStyle);
+        layer(this.pipeMesh, this.mats.pipeSolid, this.mats.pipePressure, this.stringStyle);
+        this.capMeshes.forEach((c) => (c.visible = pressure));
     }
 
     private applyModeVisibility() {
         const pressure = this.mode === 'pressure';
         this.surface.visible = !pressure;
-        this.tubeGroup.visible = pressure;
         this.controls.target.set(0, 0, pressure ? this.tubeLength / 2 : this.chartHeight / 2);
+        this.applyStyle();
     }
 
     // ---------- loop ----------

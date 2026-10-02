@@ -11,6 +11,8 @@
     top: 16px;
     left: 16px;
     width: 260px;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
     padding: 14px 16px;
     display: flex;
     flex-direction: column;
@@ -30,18 +32,114 @@
 }
 
 #panel select,
-#panel input[type='range'] {
+#panel input[type='range'],
+#panel input[type='number'] {
     width: 100%;
+    box-sizing: border-box;
 }
 
-#panel select {
+#panel select,
+#panel input[type='number'] {
     padding: 6px;
     border-radius: 6px;
     border: 1px solid #3a4250;
     background: #10141b;
     color: inherit;
+    font: inherit;
 }
 
+#panel input:disabled {
+    opacity: 0.4;
+}
+
+/* ---- sections ---- */
+#panel .group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+#panel .group h3 {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 600;
+    opacity: 0.65;
+}
+
+#panel .inline {
+    display: flex;
+    gap: 8px;
+}
+
+#panel .inline label {
+    flex: 1;
+    min-width: 0;
+}
+
+#panel .field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+#panel .field .unit {
+    width: 22px;
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+#geoInfo {
+    font-size: 11px;
+    opacity: 0.75;
+    white-space: pre-line;
+}
+
+#geoWarn {
+    font-size: 11px;
+    color: #ffb86b;
+}
+
+#geoWarn:empty {
+    display: none;
+}
+
+/* ---- layer toggles ---- */
+#panel .layer {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+#panel .layer .head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+#panel label.check {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+}
+
+.swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+}
+
+.swatch.silver {
+    background: linear-gradient(135deg, #e7ebf0, #9aa4b2);
+}
+
+.swatch.brown {
+    background: #8b5a2b;
+}
+
+/* ---- legend / readouts ---- */
 #legend {
     width: 100%;
     height: 12px;

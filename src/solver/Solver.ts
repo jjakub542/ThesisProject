@@ -1,14 +1,17 @@
+import { DEFAULT_RATIO, FORCING_TERM, OUTER_RADIUS_CELLS, SOR_OMEGA } from '../config';
+
 export class Solver {
     public size: number;
     public velocity: Float64Array;
     public geometryMask: Uint8Array; // 0 = fluid, 1 = rock, 2 = drill pipe
 
-    public radiusOuter = 40;
-    public radiusInner = 15;
+    // Radii are in grid cells. The physical diameters only enter through their ratio.
+    public radiusOuter = OUTER_RADIUS_CELLS;
+    public radiusInner = OUTER_RADIUS_CELLS * DEFAULT_RATIO;
     public eccentricity = 0.5;
 
-    private forcingTerm = 0.05; // -(dp/dz) * dx^2 / mu, constant drive
-    private omega = 1.8;        // SOR relaxation factor (1 = plain Gauss-Seidel)
+    private forcingTerm = FORCING_TERM; // -(dp/dz) * dx^2 / mu, constant drive
+    private omega = SOR_OMEGA;          // SOR relaxation factor (1 = plain Gauss-Seidel)
 
     constructor(size: number) {
         this.size = size;
@@ -23,6 +26,9 @@ export class Solver {
         radiusInner: number = this.radiusInner,
         eccentricity: number = this.eccentricity
     ) {
+        // Keep at least a 2-cell gap so the annulus is never degenerate.
+        radiusInner = Math.min(radiusInner, radiusOuter - 2);
+
         this.radiusOuter = radiusOuter;
         this.radiusInner = radiusInner;
         this.eccentricity = eccentricity;
