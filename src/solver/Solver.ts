@@ -4,7 +4,7 @@ export class Solver {
     public geometryMask: Uint8Array; // 0 = fluid, 1 = rock, 2 = drill pipe
 
     public radiusOuter = 40;
-    public radiusInner = 25;
+    public radiusInner = 15;
     public eccentricity = 0.5;
 
     private forcingTerm = 0.05; // -(dp/dz) * dx^2 / mu, constant drive

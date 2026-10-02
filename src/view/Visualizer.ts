@@ -131,7 +131,7 @@ export class Visualizer {
 
         this.surface = new THREE.Mesh(
             g,
-            new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.05, side: THREE.DoubleSide })
+            new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.99, metalness: 0.01, side: THREE.DoubleSide })
         );
         this.scene.add(this.surface);
     }

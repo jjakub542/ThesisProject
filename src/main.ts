@@ -16,7 +16,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       </select>
     </label>
     <label>Eccentricity <output id="eccOut">0.50</output>
-      <input id="ecc" type="range" min="0" max="0.95" step="0.05" value="0.5" />
+      <input id="ecc" type="range" min="0" max="0.95" step="0.01" value="0.1" />
     </label>
     <canvas id="legend" width="256" height="1"></canvas>
     <div class="range"><span id="minLabel">0</span><span id="legendTitle"></span><span id="maxLabel"></span></div>
