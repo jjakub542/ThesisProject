@@ -1,191 +1,92 @@
-import {
-    CONVERGENCE_TOL,
-    OUTER_RADIUS_CELLS,
-} from '../config';
-import {
-    Solver,
-    type FluidModel,
-    type SolverOptions,
-} from './Solver';
+import { GRID_SIZE, MAX_STEPS } from '../config';
+import type { FromWorker, SolverInput, ToWorker } from '../types';
+import { Solver } from './Solver';
 
-interface GeometryPayload {
-    /** Pipe OD / wellbore diameter. */
-    diameterRatio: number;
-    eccentricity: number;
-    /** Effective wall roughness eps / D. */
-    roughness: number;
-}
-
-interface InitPayload extends GeometryPayload {
-    size: number;
-    wellboreDiameterM: number;
-    frictionGradientPaM: number;
-    gravityAlongAxisMSS: number;
-    fluid: FluidModel;
-}
-
-interface UpdatePayload extends GeometryPayload {
-    wellboreDiameterM: number;
-    frictionGradientPaM: number;
-    gravityAlongAxisMSS: number;
-    fluid: FluidModel;
-}
-
+/**
+ * The worker owns the whole solve loop: CONFIGURE sets up the problem, then the worker keeps stepping and posting
+ * a RESULT after each step until converged. Between steps it yields to the event loop, so a newer CONFIGURE is
+ * picked up immediately and the main thread never has to ping-pong COMPUTE requests.
+ *
+ * With the "dom" lib `self` is typed as Window, whose postMessage has no (message, transfer[]) overload.
+ */
 const ctx = self as unknown as Worker;
+const post = (msg: FromWorker, transfer: Transferable[] = []) => ctx.postMessage(msg, transfer);
 
-let solver: Solver;
-let reference: Solver | null = null;
-let referenceDelta = 0;
-let referenceFlow: number | null = null;
-let dxM = 0;
+let solver: Solver | null = null;
+let reference: Solver | null = null; // same problem with smooth walls; only exists while roughness > 0
+let geometryKey = '';
+let epoch = 0;
+let steps = 0;
+let running = false;
+let referenceDone = true;
+let mainDone = false;
 
-function makeOptions(p: UpdatePayload): SolverOptions {
-    return {
-        frictionGradientPaM: p.frictionGradientPaM,
-        gravityAlongAxisMSS: p.gravityAlongAxisMSS,
-        fluid: p.fluid,
-    };
-}
+function configure(newEpoch: number, input: SolverInput) {
+    epoch = newEpoch;
+    steps = 0;
+    mainDone = false;
+    solver ??= new Solver(GRID_SIZE);
 
-function fluidFlow(s: Solver): number {
-    let sum = 0;
-    for (let i = 0; i < s.geometryMask.length; i++) {
-        if (s.geometryMask[i] === 0) sum += s.velocity[i];
-    }
-    return sum * dxM * dxM; // m³/s
-}
+    const key = JSON.stringify(input.geometry);
+    if (key !== geometryKey) {
+        geometryKey = key;
+        solver.setGeometry(input.geometry);
 
-let currentSettings: UpdatePayload | null = null;
-
-function applyParameters(p: UpdatePayload) {
-    currentSettings = p;
-
-    const options = makeOptions(p);
-    const radiusOuter = OUTER_RADIUS_CELLS;
-    const radiusInner = radiusOuter * p.diameterRatio;
-
-    dxM = (p.wellboreDiameterM / 2) / radiusOuter;
-
-    solver.setOptions(options);
-    solver.initGeometry(radiusOuter, radiusInner, p.eccentricity, p.roughness);
-
-    if (p.roughness > 0) {
-        if (!reference) {
-            reference = new Solver(solver.size, dxM, options);
+        if (input.geometry.roughness > 0) {
+            reference ??= new Solver(GRID_SIZE);
+            reference.setGeometry({ ...input.geometry, roughness: 0 });
         } else {
-            reference.setOptions(options);
+            reference = null;
         }
 
-        reference.initGeometry(radiusOuter, radiusInner, p.eccentricity, 0);
-        referenceDelta = Infinity;
-        referenceFlow = null;
-    } else {
-        reference = null;
-        referenceDelta = 0;
-        referenceFlow = null;
-    }
-}
-
-function sendGeometry(type: 'READY' | 'GEOMETRY') {
-    const mask = solver.geometryMask.slice();
-
-    ctx.postMessage(
-        {
-            type,
+        const mask = solver.mask.slice(); // copy, so it can be transferred
+        post({
+            type: 'GEOMETRY',
             mask,
             radiusOuter: solver.radiusOuter,
             radiusInner: solver.radiusInner,
             eccentricity: solver.eccentricity,
-        },
-        [mask.buffer]
-    );
+            cellSizeM: solver.cellSizeM,
+        }, [mask.buffer]);
+    }
+
+    solver.setOperating(input.fluid, input.flowRateM3S);
+    reference?.setOperating(input.fluid, input.flowRateM3S);
+    referenceDone = reference === null;
+
+    if (!running) {
+        running = true;
+        setTimeout(tick, 0);
+    }
 }
 
-const DEFAULT_FLUID: FluidModel = {
-    rheology: 'newtonian',
-    densityKgM3: 1200,
-    viscosityPaS: 0.03,
-    yieldStressPa: 5,
-    plasticViscosityPaS: 0.03,
-    consistencyPaSn: 0.5,
-    flowIndex: 0.8,
-    regularizationS: 100,
-};
+function tick() {
+    if (!solver) return;
 
-const DEFAULT_WELLBORE_DIAMETER_M = 8.5 * 0.0254;
-const DEFAULT_FRICTION_GRADIENT_PA_M = 1000;
-const DEFAULT_GRAVITY_ALONG_AXIS_MSS = 0;
+    mainDone = solver.step().converged;
+    if (reference && !referenceDone) referenceDone = reference.step().converged;
+    steps++;
 
-function normalizePayload(
-    p: Partial<UpdatePayload> & { size?: number }
-): UpdatePayload {
-    return {
-        diameterRatio: p.diameterRatio ?? 5 / 8.5,
-        eccentricity: p.eccentricity ?? 0.5,
-        roughness: p.roughness ?? 0,
-        wellboreDiameterM:
-            p.wellboreDiameterM ?? DEFAULT_WELLBORE_DIAMETER_M,
-        frictionGradientPaM:
-            p.frictionGradientPaM ?? DEFAULT_FRICTION_GRADIENT_PA_M,
-        gravityAlongAxisMSS:
-            p.gravityAlongAxisMSS ?? DEFAULT_GRAVITY_ALONG_AXIS_MSS,
-        fluid: { ...DEFAULT_FLUID, ...p.fluid },
-    };
-}
-
-self.onmessage = (e: MessageEvent) => {
-    const { type, payload } = e.data;
-
-    if (type === 'INIT') {
-        const raw = payload as Partial<InitPayload>;
-        const p = normalizePayload(raw);
-
-        dxM = (p.wellboreDiameterM / 2) / OUTER_RADIUS_CELLS;
-        solver = new Solver(
-            raw.size ?? 100,
-            dxM,
-            makeOptions(p)
-        );
-
-        applyParameters(p);
-        sendGeometry('READY');
-        return;
-    }
-
-    if (type === 'SET_GEOMETRY' || type === 'SET_PARAMETERS') {
-        const p = normalizePayload(payload as Partial<UpdatePayload>);
-        applyParameters(p);
-        sendGeometry('GEOMETRY');
-        return;
-    }
-
-if (type === 'COMPUTE') {
-    if (!currentSettings) {
-        throw new Error('COMPUTE received before fluid settings were initialized');
-    }
-
-    const delta = solver.computeStep();
-
-    if (reference && referenceDelta > CONVERGENCE_TOL) {
-        referenceDelta = reference.computeStep();
-        referenceFlow = fluidFlow(reference);
-    }
-
+    const converged = mainDone && referenceDone;
+    const exhausted = !converged && steps >= MAX_STEPS;
     const velocity = new Float64Array(solver.velocity);
-    const { frictionGradientPaM, gravityAlongAxisMSS, fluid } = currentSettings;
 
-    ctx.postMessage(
-        {
-            type: 'RESULT',
-            velocity,
-            delta: Math.max(delta, referenceDelta),
-            flowRateM3S: fluidFlow(solver),
-            referenceFlowM3S: referenceFlow,
-            frictionGradientPaM,
-            hydrostaticGradientPaM: fluid.densityKgM3 * gravityAlongAxisMSS,
-        },
-        [velocity.buffer]
-    );
-    return;
+    post({
+        type: 'RESULT',
+        epoch,
+        velocity,
+        converged,
+        exhausted,
+        gradientPaM: solver.gradientPaM,
+        areaM2: solver.areaM2,
+        plugFraction: solver.plugFraction,
+        referenceGradientPaM: reference ? reference.gradientPaM : null,
+    }, [velocity.buffer]);
+
+    if (converged || exhausted) running = false;
+    else setTimeout(tick, 0);
 }
+
+ctx.onmessage = (e: MessageEvent<ToWorker>) => {
+    if (e.data.type === 'CONFIGURE') configure(e.data.epoch, e.data.input);
 };

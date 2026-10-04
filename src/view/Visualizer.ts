@@ -1,72 +1,40 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import type { GeometryInfo, LayerStyle, ViewMode } from '../types';
+import { turbo } from './turbo';
 
-export type ViewMode = 'velocity' | 'shear' | 'pressure';
-
-export interface GeometryInfo {
-    mask: Uint8Array;
-    radiusOuter: number;
-    radiusInner: number;
-    eccentricity: number;
-}
-
-export interface Stats {
-    min: number;
-    max: number;
-    flow: number; // sum of velocity over fluid cells (cell units, proportional to flow rate Q)
-}
-
-/** Visibility + opacity of one 3D layer (drill string or wellbore). */
-export interface LayerStyle {
-    visible: boolean;
-    opacity: number; // 0..1
-}
-
-/** Google "turbo" colormap polynomial approximation, t in [0,1]. */
-export function turbo(t: number): [number, number, number] {
-    t = Math.min(1, Math.max(0, t));
-    const r = 0.13572138 + t * (4.6153926 + t * (-42.66032258 + t * (132.13108234 + t * (-152.94239396 + t * 59.28637943))));
-    const g = 0.09140261 + t * (2.19418839 + t * (4.84296658 + t * (-14.18503333 + t * (4.27729857 + t * 2.82956604))));
-    const b = 0.1066733 + t * (12.64194608 + t * (-60.58204836 + t * (110.36276771 + t * (-89.90310912 + t * 27.34824973))));
-    const c = (v: number) => Math.min(1, Math.max(0, v));
-    return [c(r), c(g), c(b)];
-}
-
+/**
+ * Three.js scene: a height-field chart of the velocity (or shear-rate) field over the annulus cross-section,
+ * enclosed by two translucent cylinders for the wellbore wall (brown) and the drill string (silver).
+ *
+ * The visualiser only draws. It knows the grid and the cell size, but nothing about fluids or hydraulics.
+ */
 export class Visualizer {
-    public onStats?: (s: Stats, mode: ViewMode) => void;
+    /** Called after every chart rebuild with the maximum of the plotted field (m/s or 1/s). */
+    onChartMax?: (max: number, mode: ViewMode) => void;
 
-    private scene = new THREE.Scene();
-    private camera: THREE.PerspectiveCamera;
-    private renderer: THREE.WebGLRenderer;
-    private controls: OrbitControls;
+    private readonly scene = new THREE.Scene();
+    private readonly camera: THREE.PerspectiveCamera;
+    private readonly renderer: THREE.WebGLRenderer;
+    private readonly controls: OrbitControls;
 
-    private N: number;
-    private worldScale = 0.05;
-    private chartHeight = 2.5;
-    private tubeLength = 4;
+    private readonly N: number;
+    private readonly worldScale = 0.05; // world units per cell
+    private readonly chartHeight = 2.5;
 
     private surface!: THREE.Mesh;
-    private tubeGroup = new THREE.Group();
-    private wellMesh: THREE.Mesh | null = null; // wellbore wall (outer tube)
-    private pipeMesh: THREE.Mesh | null = null; // drill string (inner tube)
-    private capMeshes: THREE.Mesh[] = [];       // inlet / outlet annulus caps (pressure view only)
+    private wellMesh: THREE.Mesh | null = null;
+    private pipeMesh: THREE.Mesh | null = null;
+    private readonly shells = new THREE.Group();
+
+    private readonly wellMat = new THREE.MeshStandardMaterial({ color: 0x8b5a2b, roughness: 0.9, side: THREE.DoubleSide, transparent: true });
+    private readonly pipeMat = new THREE.MeshStandardMaterial({ color: 0xc8ccd2, roughness: 0.35, metalness: 0.3, side: THREE.DoubleSide, transparent: true });
 
     private stringStyle: LayerStyle = { visible: true, opacity: 0.4 };
-    private wellboreStyle: LayerStyle = { visible: true, opacity: 0.25 };
-
-    /**
-     * Each tube has two materials:
-     *  - "Solid": plain silver / brown, used in velocity & shear views so the chart stays readable.
-     *  - "Pressure": vertex-coloured by pressure, used in the pressure view.
-     */
-    private readonly mats = {
-        wellSolid: new THREE.MeshStandardMaterial({ color: 0x8b5a2b, roughness: 0.9, metalness: 0, side: THREE.DoubleSide, transparent: true }),
-        wellPressure: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, side: THREE.BackSide, transparent: true }),
-        pipeSolid: new THREE.MeshStandardMaterial({ color: 0xc8ccd2, roughness: 0.35, metalness: 0.3, side: THREE.DoubleSide, transparent: true }),
-        pipePressure: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, side: THREE.FrontSide, transparent: true }),
-    };
+    private wellStyle: LayerStyle = { visible: true, opacity: 0.25 };
 
     private velocity: Float64Array | null = null;
+    private readonly field: Float64Array;
     private geo: GeometryInfo | null = null;
     private mode: ViewMode = 'velocity';
     private dirty = false;
@@ -76,9 +44,10 @@ export class Visualizer {
 
     constructor(canvas: HTMLCanvasElement, gridSize: number) {
         this.N = gridSize;
+        this.field = new Float64Array(gridSize * gridSize);
 
         this.camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
-        this.camera.up.set(0, 0, 1); // z-up: like a vertical well
+        this.camera.up.set(0, 0, 1); // z-up, like a vertical well
         this.camera.position.set(5.5, -6.5, 5);
 
         this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -88,6 +57,7 @@ export class Visualizer {
 
         this.controls = new OrbitControls(this.camera, canvas);
         this.controls.enableDamping = true;
+        this.controls.target.set(0, 0, this.chartHeight / 2);
 
         this.scene.add(new THREE.AmbientLight(0xffffff, 0.7));
         const key = new THREE.DirectionalLight(0xffffff, 1.1);
@@ -98,8 +68,7 @@ export class Visualizer {
         this.scene.add(fill);
 
         this.initSurface();
-        this.scene.add(this.tubeGroup);
-        this.applyModeVisibility();
+        this.scene.add(this.shells);
 
         window.addEventListener('resize', this.onWindowResize);
         this.animate();
@@ -107,44 +76,41 @@ export class Visualizer {
 
     // ---------- public API ----------
 
-    public setGeometry(info: GeometryInfo) {
+    setGeometry(info: GeometryInfo) {
         this.geo = info;
-        // Show the new mask immediately (flat field) instead of mixing it with the old solution.
-        this.velocity = new Float64Array(this.N * this.N);
-        this.buildTube();
+        this.velocity = new Float64Array(this.N * this.N); // show the new walls at once, with a flat field
+        this.buildShells();
         this.dirty = true;
     }
 
-    public updateData(velocity: Float64Array) {
+    updateData(velocity: Float64Array) {
         this.velocity = velocity;
         this.dirty = true;
     }
 
-    public setMode(mode: ViewMode) {
+    setMode(mode: ViewMode) {
         this.mode = mode;
-        this.applyModeVisibility();
         this.dirty = true;
     }
 
-    /** Drill string (inner tube, silver). */
-    public setStringStyle(style: Partial<LayerStyle>) {
-        Object.assign(this.stringStyle, style);
-        this.applyStyle();
+    /** Drill string (inner cylinder, silver). */
+    setStringStyle(style: LayerStyle) {
+        this.applyLayer(this.pipeMesh, this.pipeMat, style);
+        this.stringStyle = style;
     }
 
-    /** Wellbore wall (outer tube, brown). */
-    public setWellboreStyle(style: Partial<LayerStyle>) {
-        Object.assign(this.wellboreStyle, style);
-        this.applyStyle();
+    /** Wellbore wall (outer cylinder, brown). */
+    setWellboreStyle(style: LayerStyle) {
+        this.applyLayer(this.wellMesh, this.wellMat, style);
+        this.wellStyle = style;
     }
 
-    // ---------- surface chart ----------
+    // ---------- chart ----------
 
     private initSurface() {
         const N = this.N;
         const c = N / 2;
         const positions = new Float32Array(N * N * 3);
-        const colors = new Float32Array(N * N * 3);
 
         for (let y = 0; y < N; y++) {
             for (let x = 0; x < N; x++) {
@@ -164,7 +130,7 @@ export class Visualizer {
 
         const g = new THREE.BufferGeometry();
         g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-        g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(N * N * 3), 3));
         g.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
 
         this.surface = new THREE.Mesh(
@@ -174,44 +140,45 @@ export class Visualizer {
         this.scene.add(this.surface);
     }
 
-    private computeShear(v: Float64Array, m: Uint8Array): Float64Array {
+    /** Fills `this.field` with the plotted quantity in SI units (m/s or 1/s). */
+    private computeField(v: Float64Array, mask: Uint8Array, cellSizeM: number) {
         const N = this.N;
-        const out = new Float64Array(N * N);
+        const f = this.field;
+        f.fill(0);
+
+        if (this.mode === 'velocity') {
+            for (let i = 0; i < N * N; i++) if (mask[i] === 0) f[i] = v[i];
+            return;
+        }
+        const inv = 1 / (2 * cellSizeM);
         for (let y = 1; y < N - 1; y++) {
             for (let x = 1; x < N - 1; x++) {
                 const i = x + y * N;
-                if (m[i] !== 0) continue;
-                out[i] = Math.hypot((v[i + 1] - v[i - 1]) / 2, (v[i + N] - v[i - N]) / 2);
+                if (mask[i] === 0) f[i] = Math.hypot(v[i + 1] - v[i - 1], v[i + N] - v[i - N]) * inv;
             }
         }
-        return out;
     }
 
     private rebuildSurface() {
         if (!this.velocity || !this.geo) return;
         const N = this.N;
-        const m = this.geo.mask;
-        const v = this.velocity;
-        const field = this.mode === 'shear' ? this.computeShear(v, m) : v;
+        const { mask, cellSizeM } = this.geo;
+        this.computeField(this.velocity, mask, cellSizeM);
 
-        let max = 1e-12, flow = 0;
-        for (let i = 0; i < N * N; i++) {
-            if (m[i] !== 0) continue;
-            if (field[i] > max) max = field[i];
-            flow += v[i];
-        }
+        let max = 1e-12;
+        for (let i = 0; i < N * N; i++) if (mask[i] === 0 && this.field[i] > max) max = this.field[i];
 
         const pos = this.surface.geometry.getAttribute('position') as THREE.BufferAttribute;
         const col = this.surface.geometry.getAttribute('color') as THREE.BufferAttribute;
 
         for (let i = 0; i < N * N; i++) {
-            if (m[i] === 0) {
-                const t = field[i] / max;
+            if (mask[i] === 0) {
+                const t = this.field[i] / max;
                 const [r, g, b] = turbo(t);
                 pos.setZ(i, t * this.chartHeight);
                 col.setXYZ(i, r, g, b);
             } else {
-                const c = m[i] === 2 ? this.steelColor : this.rockColor;
+                const c = mask[i] === 2 ? this.steelColor : this.rockColor;
                 pos.setZ(i, 0);
                 col.setXYZ(i, c.r, c.g, c.b);
             }
@@ -220,126 +187,52 @@ export class Visualizer {
         col.needsUpdate = true;
         this.surface.geometry.computeVertexNormals();
 
-        this.onStats?.({ min: 0, max, flow }, this.mode);
+        this.onChartMax?.(max, this.mode);
     }
 
-    // ---------- tubes (drill string + wellbore) ----------
+    // ---------- drill string + wellbore cylinders ----------
 
-    private disposeTube() {
-        this.tubeGroup.traverse((o) => {
+    private buildShells() {
+        if (!this.geo) return;
+        this.shells.traverse((o) => {
             if (o instanceof THREE.Mesh) o.geometry.dispose();
         });
-        this.capMeshes.forEach((c) => (c.material as THREE.Material).dispose()); // caps own their material
-        this.tubeGroup.clear();
-        this.capMeshes = [];
-        this.wellMesh = null;
-        this.pipeMesh = null;
-    }
-
-    private buildTube() {
-        if (!this.geo) return;
-        this.disposeTube();
+        this.shells.clear();
 
         const s = this.worldScale;
-        const L = this.tubeLength;
-        const Ro = this.geo.radiusOuter * s;
-        const Ri = this.geo.radiusInner * s;
+        const h = this.chartHeight;
         const offset = this.geo.eccentricity * (this.geo.radiusOuter - this.geo.radiusInner) * s;
 
-        // Cylinders span z = 0..L. In chart views they are squashed to chartHeight via mesh.scale.z.
-        // Vertex colours encode pressure: p = 1 at the bottom (inlet), 0 at the top (outlet).
-        const makeCylinder = (radius: number, cx: number, material: THREE.Material) => {
-            const g = new THREE.CylinderGeometry(radius, radius, L, 128, 96, true);
+        const cylinder = (radius: number, cx: number, material: THREE.Material) => {
+            const g = new THREE.CylinderGeometry(radius, radius, h, 96, 1, true);
             g.rotateX(Math.PI / 2); // axis -> z
-            g.translate(cx, 0, L / 2);
-            const p = g.getAttribute('position');
-            const colors = new Float32Array(p.count * 3);
-            for (let i = 0; i < p.count; i++) {
-                const [r, gr, b] = turbo(1 - p.getZ(i) / L);
-                colors.set([r, gr, b], i * 3);
-            }
-            g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            g.translate(cx, 0, h / 2);
             const mesh = new THREE.Mesh(g, material);
             mesh.renderOrder = 1; // after the opaque chart
             return mesh;
         };
 
-        this.wellMesh = makeCylinder(Ro, 0, this.mats.wellSolid);
-        this.pipeMesh = makeCylinder(Ri, offset, this.mats.pipeSolid);
-        this.tubeGroup.add(this.wellMesh, this.pipeMesh);
-
-        // Annulus end caps (pressure view)
-        const shape = new THREE.Shape();
-        shape.absarc(0, 0, Ro, 0, Math.PI * 2, false);
-        const hole = new THREE.Path();
-        hole.absarc(offset, 0, Ri, 0, Math.PI * 2, true);
-        shape.holes.push(hole);
-
-        const ends: [number, number][] = [[0, 1], [L, 0]];
-        ends.forEach(([z, p]) => {
-            const [r, g, b] = turbo(p);
-            const cap = new THREE.Mesh(
-                new THREE.ShapeGeometry(shape, 96),
-                new THREE.MeshBasicMaterial({ color: new THREE.Color(r, g, b), side: THREE.DoubleSide })
-            );
-            cap.position.z = z;
-            this.capMeshes.push(cap);
-            this.tubeGroup.add(cap);
-        });
-
-        this.applyStyle();
+        this.wellMesh = cylinder(this.geo.radiusOuter * s, 0, this.wellMat);
+        this.pipeMesh = cylinder(this.geo.radiusInner * s, offset, this.pipeMat);
+        this.shells.add(this.wellMesh, this.pipeMesh);
+        this.applyLayer(this.wellMesh, this.wellMat, this.wellStyle);
+        this.applyLayer(this.pipeMesh, this.pipeMat, this.stringStyle);
     }
 
-    /** Pushes mode + layer settings onto the meshes and materials. */
-    private applyStyle() {
-        const pressure = this.mode === 'pressure';
-        const zScale = pressure ? 1 : this.chartHeight / this.tubeLength;
-
-        const layer = (
-            mesh: THREE.Mesh | null,
-            solid: THREE.MeshStandardMaterial,
-            press: THREE.MeshStandardMaterial,
-            style: LayerStyle
-        ) => {
-            solid.opacity = press.opacity = style.opacity;
-            solid.depthWrite = press.depthWrite = style.opacity >= 0.99; // translucent layers must not hide the chart
-            if (!mesh) return;
-            mesh.material = pressure ? press : solid;
-            mesh.visible = style.visible;
-            mesh.scale.z = zScale;
-        };
-
-        layer(this.wellMesh, this.mats.wellSolid, this.mats.wellPressure, this.wellboreStyle);
-        layer(this.pipeMesh, this.mats.pipeSolid, this.mats.pipePressure, this.stringStyle);
-        this.capMeshes.forEach((c) => (c.visible = pressure));
-    }
-
-    private applyModeVisibility() {
-        const pressure = this.mode === 'pressure';
-        this.surface.visible = !pressure;
-        this.controls.target.set(0, 0, pressure ? this.tubeLength / 2 : this.chartHeight / 2);
-        this.applyStyle();
+    private applyLayer(mesh: THREE.Mesh | null, mat: THREE.MeshStandardMaterial, style: LayerStyle) {
+        mat.opacity = style.opacity;
+        mat.depthWrite = style.opacity >= 0.99; // translucent layers must not hide the chart
+        if (mesh) mesh.visible = style.visible;
     }
 
     // ---------- loop ----------
 
     private animate = () => {
         requestAnimationFrame(this.animate);
-
         if (this.dirty) {
             this.dirty = false;
-            if (this.mode === 'pressure') {
-                if (this.velocity) {
-                    let flow = 0;
-                    const m = this.geo!.mask;
-                    for (let i = 0; i < m.length; i++) if (m[i] === 0) flow += this.velocity[i];
-                    this.onStats?.({ min: 0, max: 1, flow }, this.mode);
-                }
-            } else {
-                this.rebuildSurface();
-            }
+            this.rebuildSurface();
         }
-
         this.controls.update();
         this.renderer.render(this.scene, this.camera);
     };

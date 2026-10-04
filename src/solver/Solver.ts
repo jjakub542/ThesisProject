@@ -1,243 +1,190 @@
 import {
-    DEFAULT_RATIO,
-    OUTER_RADIUS_CELLS,
-    SOR_OMEGA,
-    WALL_DRAG,
+    CONVERGENCE_TOL, MIN_SHEAR_RATE, OUTER_RADIUS_CELLS, SOR_OMEGA, SWEEPS_PER_STEP, WALL_DRAG,
 } from '../config';
-
-export type RheologyModel = 'newtonian' | 'bingham' | 'herschel-bulkley';
-
-export interface FluidModel {
-    rheology: RheologyModel;
-    densityKgM3: number;
-
-    // Newtonian
-    viscosityPaS: number;
-
-    // Bingham
-    yieldStressPa: number;
-    plasticViscosityPaS: number;
-
-    // Herschel–Bulkley
-    consistencyPaSn: number;
-    flowIndex: number;
-
-    /**
-     * Papanastasiou regularization parameter [s].
-     * Larger values more closely approximate an ideal yield-stress model.
-     */
-    regularizationS: number;
-}
-
-const DEFAULT_FLUID: FluidModel = {
-    rheology: 'newtonian',
-    densityKgM3: 1200,
-    viscosityPaS: 0.03,
-    yieldStressPa: 5,
-    plasticViscosityPaS: 0.03,
-    consistencyPaSn: 0.5,
-    flowIndex: 0.8,
-    regularizationS: 100,
-};
-
-export interface SolverOptions {
-    /** Positive frictional pressure gradient driving flow [Pa/m]. */
-    frictionGradientPaM: number;
-    /** Gravity component along the positive axial direction [m/s²]. */
-    gravityAlongAxisMSS: number;
-    fluid: FluidModel;
-}
+import type { Fluid, Geometry } from '../types';
+import { apparentViscosity, isNewtonian } from './rheology';
 
 /**
- * Finite-difference solver for fully developed axial flow:
+ * Fully developed, steady, laminar axial flow in an annulus:
  *
- *   div(mu_app * grad(u)) = -G
+ *     ∇·(mu_eff ∇u) = −G        u = 0 on the wellbore wall and the pipe
  *
- * where G is the positive frictional pressure gradient [Pa/m].
+ * u [m/s] on a square grid, mu_eff [Pa·s] from the fluid model, G [Pa/m] the frictional pressure gradient.
  *
- * Velocity is in m/s, coordinates in meters, viscosity in Pa·s.
+ * The solver is flow-rate controlled: G is not an input but is adjusted until the flow rate matches the target.
+ * With a frozen viscosity field the problem is linear in G (u = G·w), so after every step u and G are scaled
+ * by the same factor. This is exact for Newtonian fluids and a fixed-point (Picard) iteration otherwise.
  */
 export class Solver {
-    public size: number;
-    public velocity: Float64Array;
-    public geometryMask: Uint8Array; // 0 = fluid, 1 = rock, 2 = drill pipe
-    /** Effective wall resistance inherited from the original model. */
-    public drag: Float64Array;
+    readonly size: number;
+    readonly velocity: Float64Array;
+    /** 0 = fluid, 1 = rock, 2 = drill pipe */
+    readonly mask: Uint8Array;
 
-    public radiusOuter = OUTER_RADIUS_CELLS;
-    public radiusInner = OUTER_RADIUS_CELLS * DEFAULT_RATIO;
-    public eccentricity = 0.5;
-    public roughness = 0;
+    cellSizeM = 1;
+    areaM2 = 0;
+    radiusOuter = OUTER_RADIUS_CELLS;
+    radiusInner = 0;
+    eccentricity = 0;
+    /** Frictional pressure gradient [Pa/m] that produces the target flow rate. */
+    gradientPaM = 100;
+    plugFraction = 0;
 
-    private dxM: number;
-    private options: SolverOptions;
-    private omega = SOR_OMEGA;
+    private readonly drag: Float64Array; // extra wall resistance per cell (roughness layer)
+    private readonly muX: Float64Array;  // effective viscosity on the face between cell i and i+1
+    private readonly muY: Float64Array;  // effective viscosity on the face between cell i and i+size
+    private readonly prev: Float64Array;
+    private fluid: Fluid = { densityKgM3: 1000, yieldStressPa: 0, consistencyPaSn: 0.001, flowIndex: 1 };
+    private targetFlowM3S = 0;
 
-    constructor(
-        size: number,
-        dxM: number,
-        options: SolverOptions = {
-            frictionGradientPaM: 1000,
-            gravityAlongAxisMSS: 0,
-            fluid: DEFAULT_FLUID,
-        }
-    ) {
+    constructor(size: number) {
         this.size = size;
-        this.dxM = dxM;
-        this.options = options;
-        this.velocity = new Float64Array(size * size);
-        this.geometryMask = new Uint8Array(size * size);
-        this.drag = new Float64Array(size * size);
-        this.initGeometry();
+        const cells = size * size;
+        this.velocity = new Float64Array(cells);
+        this.mask = new Uint8Array(cells);
+        this.drag = new Float64Array(cells);
+        this.muX = new Float64Array(cells);
+        this.muY = new Float64Array(cells);
+        this.prev = new Float64Array(cells);
     }
 
-    public setOptions(options?: Partial<SolverOptions>) {
-        if (!options?.fluid) return;
+    /** Rebuilds mask, roughness layer and cell size, and restarts the solution from rest. */
+    setGeometry(g: Geometry) {
+        const n = this.size;
+        const Ro = OUTER_RADIUS_CELLS;
+        const Ri = Math.min((Ro * g.pipeDiameterM) / g.wellboreDiameterM, Ro - 3); // keep a >= 3-cell gap
+        const thickness = g.roughness * 2 * Ro; // roughness layer thickness in cells
+        const cx = n / 2;
+        const cxInner = cx + g.eccentricity * (Ro - Ri);
 
-        this.options = {
-            ...this.options,
-            ...options,
-            fluid: { ...this.options.fluid, ...options.fluid },
-        };
-        this.velocity.fill(0);
-    }
+        for (let y = 0; y < n; y++) {
+            for (let x = 0; x < n; x++) {
+                const i = x + y * n;
+                const distOuter = Math.hypot(x - cx, y - cx);
+                const distInner = Math.hypot(x - cxInner, y - cx);
 
-    /** Rebuild geometry and reset the velocity solution. */
-    public initGeometry(
-        radiusOuter: number = this.radiusOuter,
-        radiusInner: number = this.radiusInner,
-        eccentricity: number = this.eccentricity,
-        roughness: number = this.roughness
-    ) {
-        radiusInner = Math.min(radiusInner, radiusOuter - 2);
-
-        this.radiusOuter = radiusOuter;
-        this.radiusInner = radiusInner;
-        this.eccentricity = eccentricity;
-        this.roughness = roughness;
-
-        const thickness = roughness * 2 * radiusOuter;
-        const e = eccentricity * (radiusOuter - radiusInner);
-        const cx = this.size / 2;
-        const cy = this.size / 2;
-        const cxInner = cx + e;
-
-        for (let y = 0; y < this.size; y++) {
-            for (let x = 0; x < this.size; x++) {
-                const i = x + y * this.size;
-                const distOuter = Math.hypot(x - cx, y - cy);
-                const distInner = Math.hypot(x - cxInner, y - cy);
-
-                if (distOuter >= radiusOuter) this.geometryMask[i] = 1;
-                else if (distInner <= radiusInner) this.geometryMask[i] = 2;
-                else this.geometryMask[i] = 0;
-
+                // The no-slip nodes are the first non-fluid cells, about half a cell beyond the fluid edge. Shifting the
+                // fluid edge inwards by 0.5 cell puts the effective walls at the nominal radii.
                 let coverage = 0;
-                if (this.geometryMask[i] === 0 && thickness > 0) {
-                    const distanceFromWall = Math.max(radiusOuter - distOuter - 0.5, 0);
-                    coverage = Math.min(1, Math.max(0, thickness - distanceFromWall));
+                if (distOuter >= Ro - 0.5) this.mask[i] = 1;
+                else if (distInner <= Ri + 0.5) this.mask[i] = 2;
+                else {
+                    this.mask[i] = 0;
+                    // fraction of this cell inside the roughness layer next to the wellbore wall
+                    if (thickness > 0) coverage = Math.min(1, Math.max(0, thickness - Math.max(Ro - distOuter - 0.5, 0)));
                 }
-
                 this.drag[i] = WALL_DRAG * coverage;
-                this.velocity[i] = 0;
             }
         }
+
+        this.radiusOuter = Ro;
+        this.radiusInner = Ri;
+        this.eccentricity = g.eccentricity;
+        this.cellSizeM = g.wellboreDiameterM / 2 / Ro;
+        this.areaM2 = (Math.PI / 4) * (g.wellboreDiameterM ** 2 - g.pipeDiameterM ** 2);
+        this.velocity.fill(0);
+        this.gradientPaM = 100;
+        this.resetViscosity();
     }
 
-    private apparentViscosity(shearRate: number): number {
-        const { fluid } = this.options;
-        const gamma = Math.max(shearRate, 1e-8);
-
-        if (fluid.rheology === 'newtonian') {
-            return fluid.viscosityPaS;
+    /** Changes fluid and target flow rate. The velocity field is kept as a warm start. */
+    setOperating(fluid: Fluid, flowRateM3S: number) {
+        this.fluid = fluid;
+        this.targetFlowM3S = flowRateM3S;
+        if (isNewtonian(fluid)) {
+            this.muX.fill(fluid.consistencyPaSn);
+            this.muY.fill(fluid.consistencyPaSn);
+            this.plugFraction = 0;
         }
-
-        const m = Math.max(fluid.regularizationS, 1e-6);
-        const regularizedYield =
-            fluid.yieldStressPa * (-Math.expm1(-m * gamma)) / gamma;
-
-        if (fluid.rheology === 'bingham') {
-            return fluid.plasticViscosityPaS + regularizedYield;
-        }
-
-        const n = Math.max(fluid.flowIndex, 0.05);
-        const consistency = Math.max(fluid.consistencyPaSn, 1e-12);
-
-        return consistency * gamma ** (n - 1) + regularizedYield;
     }
 
-    private localShearRate(i: number): number {
-        const n = this.size;
+    private resetViscosity() {
+        const mu0 = apparentViscosity(this.fluid, 0); // highest viscosity: start from the stiff, slow state
+        this.muX.fill(mu0);
+        this.muY.fill(mu0);
+        this.plugFraction = 0;
+    }
+
+    /** One viscosity update, SWEEPS_PER_STEP SOR sweeps with it frozen, then a flow-rate correction. */
+    step(): { converged: boolean } {
         const u = this.velocity;
-        const duDx = (u[i + 1] - u[i - 1]) / (2 * this.dxM);
-        const duDy = (u[i + n] - u[i - n]) / (2 * this.dxM);
-        return Math.hypot(duDx, duDy);
+        this.prev.set(u);
+
+        if (!isNewtonian(this.fluid)) this.updateViscosity();
+        for (let s = 0; s < SWEEPS_PER_STEP; s++) this.sweep();
+
+        // flow-rate control: scale u and G together so that Q = target
+        const q = this.flowRateM3S();
+        if (q > 1e-30 && this.targetFlowM3S > 0) {
+            const r = this.targetFlowM3S / q;
+            for (let i = 0; i < u.length; i++) u[i] *= r;
+            this.gradientPaM *= r;
+        }
+
+        let maxU = 1e-30, maxChange = 0;
+        for (let i = 0; i < u.length; i++) {
+            maxU = Math.max(maxU, Math.abs(u[i]));
+            maxChange = Math.max(maxChange, Math.abs(u[i] - this.prev[i]));
+        }
+        return { converged: maxChange / maxU < CONVERGENCE_TOL };
     }
 
-    private harmonicMean(a: number, b: number): number {
-        const sum = a + b;
-        return sum > 0 ? (2 * a * b) / sum : 0;
+    flowRateM3S(): number {
+        let sum = 0;
+        for (let i = 0; i < this.velocity.length; i++) sum += this.velocity[i];
+        return sum * this.cellSizeM ** 2;
+    }
+
+    /** One SOR sweep of the face-flux discretisation, with the current face viscosities and gradient. */
+    private sweep() {
+        const { size: n, velocity: u, mask, muX, muY, drag } = this;
+        const source = this.gradientPaM * this.cellSizeM ** 2;
+
+        for (let y = 1; y < n - 1; y++) {
+            for (let x = 1; x < n - 1; x++) {
+                const i = x + y * n;
+                if (mask[i] !== 0) continue;
+
+                const w = muX[i - 1], e = muX[i], s = muY[i - n], nn = muY[i];
+                const sumMu = w + e + s + nn;
+                // u = 0 in wall cells (no-slip); the roughness layer adds drag * (mean viscosity) to the diagonal
+                const gs = (w * u[i - 1] + e * u[i + 1] + s * u[i - n] + nn * u[i + n] + source) / (sumMu * (1 + drag[i] / 4));
+                u[i] += SOR_OMEGA * (gs - u[i]);
+            }
+        }
     }
 
     /**
-     * Advances nonlinear Picard/SOR iterations.
-     * Returns max velocity change from the final sweep [m/s].
+     * Picard update of the viscosity on every cell face next to fluid. The shear rate on a face combines
+     * the normal difference across it with the transverse gradient averaged over the two cells, so the stress
+     * mu·du/dn used in the flux is consistent with mu(|∇u|).
      */
-    public computeStep(iterations = 30): number {
-        const n = this.size;
-        const u = this.velocity;
-        const mask = this.geometryMask;
-        const dx2 = this.dxM * this.dxM;
-        const G = Math.max(this.options.frictionGradientPaM, 0);
+    private updateViscosity() {
+        const { size: n, velocity: u, mask, muX, muY } = this;
+        const inv = 1 / this.cellSizeM;
+        const gradX = (k: number) => (u[k + 1] - u[k - 1]) * 0.5 * inv;
+        const gradY = (k: number) => (u[k + n] - u[k - n]) * 0.5 * inv;
+        let cells = 0, plug = 0;
 
-        let maxDelta = 0;
+        for (let y = 1; y < n - 1; y++) {
+            for (let x = 1; x < n - 1; x++) {
+                const i = x + y * n;
+                const fluid = mask[i] === 0;
 
-        for (let iter = 0; iter < iterations; iter++) {
-            maxDelta = 0;
-
-            for (let y = 1; y < n - 1; y++) {
-                for (let x = 1; x < n - 1; x++) {
-                    const i = x + y * n;
-                    if (mask[i] !== 0) continue;
-
-                    const mu = this.apparentViscosity(this.localShearRate(i));
-
-                    const muW = mask[i - 1] === 0
-                        ? this.harmonicMean(mu, this.apparentViscosity(this.localShearRate(i - 1)))
-                        : mu;
-                    const muE = mask[i + 1] === 0
-                        ? this.harmonicMean(mu, this.apparentViscosity(this.localShearRate(i + 1)))
-                        : mu;
-                    const muS = mask[i - n] === 0
-                        ? this.harmonicMean(mu, this.apparentViscosity(this.localShearRate(i - n)))
-                        : mu;
-                    const muN = mask[i + n] === 0
-                        ? this.harmonicMean(mu, this.apparentViscosity(this.localShearRate(i + n)))
-                        : mu;
-
-                    // Face-flux discretization. Solid-neighbour velocities are zero
-                    // (no-slip); their face coefficients remain in the diagonal.
-                    const diagonal = muW + muE + muS + muN;
-                    if (diagonal <= 0) continue;
-
-                    const gs = (
-                        muW * u[i - 1] +
-                        muE * u[i + 1] +
-                        muS * u[i - n] +
-                        muN * u[i + n] +
-                        G * dx2
-                    ) / diagonal;
-
-                    // Retain the original illustrative wall-resistance term.
-                    const withWallDrag = gs / (1 + this.drag[i]);
-                    const next = u[i] + this.omega * (withWallDrag - u[i]);
-
-                    maxDelta = Math.max(maxDelta, Math.abs(next - u[i]));
-                    u[i] = next;
+                if (fluid || mask[i + 1] === 0) {
+                    const shear = Math.hypot((u[i + 1] - u[i]) * inv, 0.5 * (gradY(i) + gradY(i + 1)));
+                    muX[i] = apparentViscosity(this.fluid, shear);
+                }
+                if (fluid || mask[i + n] === 0) {
+                    const shear = Math.hypot((u[i + n] - u[i]) * inv, 0.5 * (gradX(i) + gradX(i + n)));
+                    muY[i] = apparentViscosity(this.fluid, shear);
+                }
+                if (fluid) {
+                    cells++;
+                    if (Math.hypot(gradX(i), gradY(i)) < MIN_SHEAR_RATE) plug++;
                 }
             }
         }
-
-        return maxDelta;
+        this.plugFraction = this.fluid.yieldStressPa > 0 && cells > 0 ? plug / cells : 0;
     }
 }
