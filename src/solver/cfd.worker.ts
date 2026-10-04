@@ -1,4 +1,4 @@
-import { GRID_SIZE, MAX_STEPS } from '../config';
+import { MAX_STEPS, RESOLUTION_RADIUS_CELLS, gridSizeFor } from '../config';
 import type { FromWorker, SolverInput, ToWorker } from '../types';
 import { Solver } from './Solver';
 
@@ -25,16 +25,18 @@ function configure(newEpoch: number, input: SolverInput) {
     epoch = newEpoch;
     steps = 0;
     mainDone = false;
-    solver ??= new Solver(GRID_SIZE);
+    const radiusCells = RESOLUTION_RADIUS_CELLS[input.resolution];
+    const size = gridSizeFor(radiusCells);
 
-    const key = JSON.stringify(input.geometry);
+    const key = JSON.stringify([input.geometry, input.resolution]);
     if (key !== geometryKey) {
         geometryKey = key;
-        solver.setGeometry(input.geometry);
+        if (!solver || solver.size !== size) solver = new Solver(size);
+        solver.setGeometry(input.geometry, radiusCells);
 
         if (input.geometry.roughness > 0) {
-            reference ??= new Solver(GRID_SIZE);
-            reference.setGeometry({ ...input.geometry, roughness: 0 });
+            if (!reference || reference.size !== size) reference = new Solver(size);
+            reference.setGeometry({ ...input.geometry, roughness: 0 }, radiusCells);
         } else {
             reference = null;
         }
@@ -42,6 +44,7 @@ function configure(newEpoch: number, input: SolverInput) {
         const mask = solver.mask.slice(); // copy, so it can be transferred
         post({
             type: 'GEOMETRY',
+            gridSize: size,
             mask,
             radiusOuter: solver.radiusOuter,
             radiusInner: solver.radiusInner,
@@ -50,7 +53,7 @@ function configure(newEpoch: number, input: SolverInput) {
         }, [mask.buffer]);
     }
 
-    solver.setOperating(input.fluid, input.flowRateM3S);
+    solver!.setOperating(input.fluid, input.flowRateM3S);
     reference?.setOperating(input.fluid, input.flowRateM3S);
     referenceDone = reference === null;
 

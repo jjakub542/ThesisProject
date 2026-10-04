@@ -10,6 +10,7 @@ const input = (flowGpm: number, roughness = 0, mu = 0.03): SolverInput => ({
     geometry: { wellboreDiameterM: 8.5 * IN, pipeDiameterM: 5 * IN, eccentricity: 0.5, roughness },
     fluid: { densityKgM3: 1200, yieldStressPa: 0, consistencyPaSn: mu, flowIndex: 1 },
     flowRateM3S: flowGpm * GPM,
+    resolution: 'standard',
 });
 const send = (epoch: number, i: SolverInput) => scope.onmessage({ data: { type: 'CONFIGURE', epoch, input: i } });
 const idle = () => new Promise((r) => setTimeout(r, 400));

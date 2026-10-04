@@ -1,6 +1,5 @@
 import './style.css';
 import './panel.css';
-import { GRID_SIZE } from './config';
 import { SolverClient } from './solver/SolverClient';
 import { Hud } from './ui/hud';
 import { createPanel } from './ui/panel';
@@ -16,6 +15,14 @@ import { Visualizer } from './view/Visualizer';
 
 const state = createState();
 
+/** Pushes every view-only setting into the visualiser. */
+function applyViewSettings() {
+    visualizer.setStringStyle(state.stringLayer);
+    visualizer.setWellboreStyle(state.wellboreLayer);
+    visualizer.setTubeLength(state.tubeLength);
+    visualizer.setSmoothing(state.smoothing);
+}
+
 const panel = createPanel(state, {
     onSolverChange: () => {
         hud.setPending();
@@ -25,14 +32,11 @@ const panel = createPanel(state, {
         visualizer.setMode(state.mode);
         hud.schedule();
     },
-    onLayersChange: () => {
-        visualizer.setStringStyle(state.stringLayer);
-        visualizer.setWellboreStyle(state.wellboreLayer);
-    },
+    onViewChange: applyViewSettings,
     onUnitsChange: () => hud.schedule(),
 });
 
-const visualizer = new Visualizer(document.getElementById('canvas3d') as HTMLCanvasElement, GRID_SIZE);
+const visualizer = new Visualizer(document.getElementById('canvas3d') as HTMLCanvasElement);
 const hud = new Hud(state);
 const solver = new SolverClient();
 
@@ -46,7 +50,6 @@ solver.onResult = (r) => {
 // initial push of the state into the view and the solver
 panel.sync();
 visualizer.setMode(state.mode);
-visualizer.setStringStyle(state.stringLayer);
-visualizer.setWellboreStyle(state.wellboreLayer);
+applyViewSettings();
 hud.setPending();
 solver.configure(toSolverInput(state));

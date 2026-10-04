@@ -3,6 +3,8 @@
 export type RheologyModel = 'newtonian' | 'bingham' | 'herschel-bulkley';
 export type FluidBase = 'water' | 'oil';
 export type ViewMode = 'velocity' | 'shear';
+/** Solver grid density: cells across the wellbore radius (see RESOLUTION_RADIUS_CELLS in config.ts). */
+export type Resolution = 'standard' | 'high' | 'fine';
 
 /** Herschel–Bulkley fluid: tau = tau_y + K * shearRate^n. Newtonian and Bingham are special cases. */
 export interface Fluid {
@@ -27,10 +29,13 @@ export interface SolverInput {
     geometry: Geometry;
     fluid: Fluid;
     flowRateM3S: number;
+    resolution: Resolution;
 }
 
 /** What the visualiser needs to know about the grid. Radii are in cells. */
 export interface GeometryInfo {
+    /** Grid is gridSize x gridSize cells. */
+    gridSize: number;
     mask: Uint8Array; // 0 = fluid, 1 = rock, 2 = drill pipe
     radiusOuter: number;
     radiusInner: number;

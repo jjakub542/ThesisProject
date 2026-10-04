@@ -1,6 +1,6 @@
 import { LIMITS } from '../config';
 import { BIT_PRESETS, FORMATIONS, MUD_PRESETS } from '../presets';
-import type { FluidBase, RheologyModel, ViewMode } from '../types';
+import type { FluidBase, Resolution, RheologyModel, ViewMode } from '../types';
 import { fromDisplay, plain, toDisplay, unitLabel, type Quantity, type UnitSystem } from '../units';
 import { clamp } from '../util';
 import { turbo } from '../view/turbo';
@@ -10,7 +10,8 @@ export interface PanelHooks {
     /** Anything the solver depends on changed. */
     onSolverChange(): void;
     onModeChange(): void;
-    onLayersChange(): void;
+    /** Layers, tube length or display smoothing changed. */
+    onViewChange(): void;
     /** Only the display units changed. */
     onUnitsChange(): void;
 }
@@ -116,6 +117,25 @@ const TEMPLATE = `
         </div>
         <input type="range" id="opacityWellbore" min="0.05" max="1" step="0.05" />
       </div>
+      <div class="layer">
+        <div class="head"><span>Tube length</span><output id="tubeLengthOut"></output></div>
+        <input type="range" id="tubeLength" min="1" max="6" step="0.5" />
+      </div>
+    </div>
+
+    <div class="group">
+      <h3>Quality</h3>
+      <label>Display smoothing <select id="smoothing">${options([
+          { value: '1', label: 'Off (solver grid)' },
+          { value: '2', label: 'Smooth (2×)' },
+          { value: '4', label: 'Fine (4×)' },
+      ])}</select></label>
+      <label>Solver resolution <select id="resolution">${options([
+          { value: 'standard', label: 'Standard (40 cells / radius)' },
+          { value: 'high', label: 'High (64), ~2× slower' },
+          { value: 'fine', label: 'Fine (96), ~4× slower' },
+      ])}</select></label>
+      <div class="note">Smoothing only changes how the field is drawn. Resolution re-solves it on a finer grid.</div>
     </div>
 
     <div class="group">
@@ -225,6 +245,12 @@ export function createPanel(state: AppState, hooks: PanelHooks): { sync(): void 
             $<HTMLInputElement>(`opacity${name}`).disabled = !layer.visible;
             $(`opacity${name}Out`).textContent = `${Math.round(layer.opacity * 100)}%`;
         }
+        $<HTMLInputElement>('tubeLength').value = String(state.tubeLength);
+        $('tubeLengthOut').textContent = `${state.tubeLength}×`;
+
+        // quality
+        $<HTMLSelectElement>('smoothing').value = String(state.smoothing);
+        $<HTMLSelectElement>('resolution').value = state.resolution;
     }
 
     /** Sync the inputs, then tell the app that the solver problem changed. */
@@ -302,11 +328,26 @@ export function createPanel(state: AppState, hooks: PanelHooks): { sync(): void 
             layer.visible = $<HTMLInputElement>(`show${name}`).checked;
             layer.opacity = parseFloat($<HTMLInputElement>(`opacity${name}`).value);
             sync();
-            hooks.onLayersChange();
+            hooks.onViewChange();
         };
         $(`show${name}`).addEventListener('change', update);
         $(`opacity${name}`).addEventListener('input', update);
     }
+
+    $<HTMLInputElement>('tubeLength').addEventListener('input', (e) => {
+        state.tubeLength = parseFloat((e.target as HTMLInputElement).value);
+        sync();
+        hooks.onViewChange();
+    });
+    $<HTMLSelectElement>('smoothing').addEventListener('change', (e) => {
+        state.smoothing = Number((e.target as HTMLSelectElement).value);
+        sync();
+        hooks.onViewChange();
+    });
+    $<HTMLSelectElement>('resolution').addEventListener('change', (e) => {
+        state.resolution = (e.target as HTMLSelectElement).value as Resolution;
+        commit();
+    });
 
     return { sync: () => sync() };
 }

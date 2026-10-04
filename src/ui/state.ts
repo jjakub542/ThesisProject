@@ -2,7 +2,7 @@ import { LIMITS } from '../config';
 import { MUD_PRESETS } from '../presets';
 import { clamp } from '../util';
 import type { UnitSystem } from '../units';
-import type { Fluid, FluidBase, LayerStyle, RheologyModel, SolverInput, ViewMode } from '../types';
+import type { Fluid, FluidBase, LayerStyle, Resolution, RheologyModel, SolverInput, ViewMode } from '../types';
 
 /** The single source of truth for the UI. Every physical value is stored in SI units. */
 export interface AppState {
@@ -28,6 +28,13 @@ export interface AppState {
 
     stringLayer: LayerStyle;
     wellboreLayer: LayerStyle;
+    /** Cylinder length as a multiple of the chart height. Purely visual: the flow is fully developed. */
+    tubeLength: number;
+
+    /** Solver grid density (changes the solution slightly and the run time a lot). */
+    resolution: Resolution;
+    /** Render cells per solver cell along each axis (view only, no re-solve). */
+    smoothing: number;
 }
 
 export function createState(): AppState {
@@ -49,6 +56,9 @@ export function createState(): AppState {
         flowIndex: 1,
         stringLayer: { visible: true, opacity: 0.4 },
         wellboreLayer: { visible: true, opacity: 0.25 },
+        tubeLength: 1,
+        resolution: 'standard',
+        smoothing: 2,
     };
     applyMudPreset(state, MUD_PRESETS.findIndex((m) => m.label === 'Bentonite WBM'));
     return state;
@@ -95,5 +105,6 @@ export function toSolverInput(s: AppState): SolverInput {
         },
         fluid: toFluid(s),
         flowRateM3S: s.flowRateM3S,
+        resolution: s.resolution,
     };
 }

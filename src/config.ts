@@ -1,12 +1,14 @@
+import type { Resolution } from './types';
+
 /** Numerical and physical constants shared by the solver, worker and UI. */
 
 export const GRAVITY = 9.80665; // m/s²
 
 // ---- grid & iteration ----
-export const GRID_SIZE = 100;
-/** The wellbore always spans this many cells in radius, whatever its physical size. */
-export const OUTER_RADIUS_CELLS = 40;
-export const SOR_OMEGA = 1.8;
+/** Cells across the wellbore radius for each resolution; the wellbore always fills the grid the same way. */
+export const RESOLUTION_RADIUS_CELLS: Record<Resolution, number> = { standard: 40, high: 64, fine: 96 };
+/** The square grid leaves a margin of rock around the wellbore. */
+export const gridSizeFor = (radiusCells: number) => Math.round(radiusCells * 2.5);
 export const SWEEPS_PER_STEP = 30;
 /** Relative change of the velocity field over one step below which the solution counts as converged. */
 export const CONVERGENCE_TOL = 1e-5;

@@ -1,5 +1,6 @@
 /** Numerical sanity checks for the solver. Run with:  npx tsx scripts/check-solver.ts */
-import { GRID_SIZE, MAX_STEPS } from '../src/config';
+import { MAX_STEPS, RESOLUTION_RADIUS_CELLS, gridSizeFor } from '../src/config';
+import type { Resolution } from '../src/types';
 import { Solver } from '../src/solver/Solver';
 import { MUD_PRESETS } from '../src/presets';
 import type { Fluid, Geometry } from '../src/types';
@@ -8,9 +9,10 @@ const IN = 0.0254;
 const GPM = 3.785411784e-3 / 60;
 const D = 8.5 * IN, d = 5 * IN;
 
-function solve(geometry: Geometry, fluid: Fluid, q: number) {
-    const s = new Solver(GRID_SIZE);
-    s.setGeometry(geometry);
+function solve(geometry: Geometry, fluid: Fluid, q: number, resolution: Resolution = 'standard') {
+    const R = RESOLUTION_RADIUS_CELLS[resolution];
+    const s = new Solver(gridSizeFor(R));
+    s.setGeometry(geometry, R);
     s.setOperating(fluid, q);
     let steps = 0, converged = false;
     const t0 = performance.now();
@@ -81,8 +83,9 @@ for (const p of MUD_PRESETS) {
     const rough = solve(geo(0.5, 0.05), newt(0.03), 200 * GPM).s.gradientPaM;
     check('Roughness raises G', rough > smooth, `smooth=${smooth.toFixed(1)} rough=${rough.toFixed(1)} (+${((rough / smooth - 1) * 100).toFixed(0)}%)`);
 
-    const s = new Solver(GRID_SIZE);
-    s.setGeometry(geo(0.5));
+    const R = RESOLUTION_RADIUS_CELLS.standard;
+    const s = new Solver(gridSizeFor(R));
+    s.setGeometry(geo(0.5), R);
     const p = MUD_PRESETS.find((m) => m.label === 'Bentonite WBM')!;
     const fl = (k: number): Fluid => ({ densityKgM3: p.densityKgM3, yieldStressPa: p.yieldStressPa, consistencyPaSn: k, flowIndex: 1 });
     s.setOperating(fl(0.015), 200 * GPM);
@@ -90,6 +93,21 @@ for (const p of MUD_PRESETS) {
     s.setOperating(fl(0.030), 200 * GPM);
     let m = 0; while (!s.step().converged && m < MAX_STEPS) m++;
     check('Warm start after fluid change', m < n, `cold=${n} steps, warm=${m} steps`);
+}
+
+// 7. Higher resolutions: same physics (within a few %), still converge
+{
+    const mu = 0.03, q = 200 * GPM, a = d / 2, b = D / 2;
+    const exactG = (q * 8 * mu) / (Math.PI * (b ** 4 - a ** 4 - (b * b - a * a) ** 2 / Math.log(b / a)));
+    const p = MUD_PRESETS.find((m) => m.label === 'Bentonite WBM')!;
+    const bingham: Fluid = { densityKgM3: p.densityKgM3, yieldStressPa: p.yieldStressPa, consistencyPaSn: p.consistencyPaSn, flowIndex: 1 };
+    const base = solve(geo(0.5), bingham, q).s.gradientPaM;
+    for (const res of ['high', 'fine'] as const) {
+        const n = solve(geo(), newt(mu), q, res);
+        const r = solve(geo(0.5), bingham, q, res);
+        check(`Resolution "${res}"`, n.converged && r.converged && Math.abs(n.s.gradientPaM / exactG - 1) < 0.05 && Math.abs(r.s.gradientPaM / base - 1) < 0.05,
+            `Newtonian err=${((n.s.gradientPaM / exactG - 1) * 100).toFixed(2)}% Bingham vs standard=${((r.s.gradientPaM / base - 1) * 100).toFixed(2)}% steps=${r.steps} ${r.ms.toFixed(0)}ms`);
+    }
 }
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`);

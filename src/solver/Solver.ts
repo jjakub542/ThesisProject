@@ -1,5 +1,5 @@
 import {
-    CONVERGENCE_TOL, MIN_SHEAR_RATE, OUTER_RADIUS_CELLS, SOR_OMEGA, SWEEPS_PER_STEP, WALL_DRAG,
+    CONVERGENCE_TOL, MIN_SHEAR_RATE, SWEEPS_PER_STEP, WALL_DRAG,
 } from '../config';
 import type { Fluid, Geometry } from '../types';
 import { apparentViscosity, isNewtonian } from './rheology';
@@ -23,7 +23,7 @@ export class Solver {
 
     cellSizeM = 1;
     areaM2 = 0;
-    radiusOuter = OUTER_RADIUS_CELLS;
+    radiusOuter = 0;
     radiusInner = 0;
     eccentricity = 0;
     /** Frictional pressure gradient [Pa/m] that produces the target flow rate. */
@@ -36,6 +36,7 @@ export class Solver {
     private readonly prev: Float64Array;
     private fluid: Fluid = { densityKgM3: 1000, yieldStressPa: 0, consistencyPaSn: 0.001, flowIndex: 1 };
     private targetFlowM3S = 0;
+    private omega = 1.8;
 
     constructor(size: number) {
         this.size = size;
@@ -48,10 +49,15 @@ export class Solver {
         this.prev = new Float64Array(cells);
     }
 
-    /** Rebuilds mask, roughness layer and cell size, and restarts the solution from rest. */
-    setGeometry(g: Geometry) {
+    /**
+     * Rebuilds mask, roughness layer and cell size, and restarts the solution from rest.
+     * `outerRadiusCells` is the wellbore radius in cells (the resolution).
+     */
+    setGeometry(g: Geometry, outerRadiusCells: number) {
         const n = this.size;
-        const Ro = OUTER_RADIUS_CELLS;
+        const Ro = outerRadiusCells;
+        // optimal SOR relaxation for a square domain 2R cells wide; the best value found for every resolution
+        this.omega = Math.min(1.98, 2 / (1 + Math.sin(Math.PI / (2 * Ro))));
         const Ri = Math.min((Ro * g.pipeDiameterM) / g.wellboreDiameterM, Ro - 3); // keep a >= 3-cell gap
         const thickness = g.roughness * 2 * Ro; // roughness layer thickness in cells
         const cx = n / 2;
@@ -137,7 +143,7 @@ export class Solver {
 
     /** One SOR sweep of the face-flux discretisation, with the current face viscosities and gradient. */
     private sweep() {
-        const { size: n, velocity: u, mask, muX, muY, drag } = this;
+        const { size: n, velocity: u, mask, muX, muY, drag, omega } = this;
         const source = this.gradientPaM * this.cellSizeM ** 2;
 
         for (let y = 1; y < n - 1; y++) {
@@ -149,7 +155,7 @@ export class Solver {
                 const sumMu = w + e + s + nn;
                 // u = 0 in wall cells (no-slip); the roughness layer adds drag * (mean viscosity) to the diagonal
                 const gs = (w * u[i - 1] + e * u[i + 1] + s * u[i - n] + nn * u[i + n] + source) / (sumMu * (1 + drag[i] / 4));
-                u[i] += SOR_OMEGA * (gs - u[i]);
+                u[i] += omega * (gs - u[i]);
             }
         }
     }
