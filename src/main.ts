@@ -97,6 +97,73 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       </div>
     </div>
 
+    <div class="group">
+        <h3>Fluid / mud</h3>
+
+        <label>Base fluid
+            <select id="fluidBase">
+            <option value="water">Water-based</option>
+            <option value="oil">Oil-based</option>
+            </select>
+        </label>
+
+        <label>Rheology
+            <select id="rheology">
+            <option value="newtonian">Newtonian</option>
+            <option value="bingham">Bingham Plastic</option>
+            <option value="herschel-bulkley">Herschel–Bulkley</option>
+            </select>
+        </label>
+
+        <label>Mud density
+            <span class="field">
+            <input id="mudDensity" type="number" min="500" max="3000" step="10" />
+            <span>kg/m³</span>
+            </span>
+        </label>
+<div id="newtonianFields">
+  <label>Dynamic viscosity
+    <span class="field">
+      <input id="viscosity" type="number" min="0.000001" step="0.001" />
+      <span>Pa·s</span>
+    </span>
+  </label>
+</div>
+
+<div id="binghamFields" hidden>
+  <label>Yield stress
+    <span class="field">
+      <input id="yieldStress" type="number" min="0" step="0.1" />
+      <span>Pa</span>
+    </span>
+  </label>
+  <label>Plastic viscosity
+    <span class="field">
+      <input id="plasticViscosity" type="number" min="0.000001" step="0.001" />
+      <span>Pa·s</span>
+    </span>
+  </label>
+</div>
+
+<div id="hbFields" hidden>
+  <label>Yield stress
+    <span class="field">
+      <input id="hbYieldStress" type="number" min="0" step="0.1" />
+      <span>Pa</span>
+    </span>
+  </label>
+  <label>Consistency K
+    <span class="field">
+      <input id="consistency" type="number" min="0.000001" step="0.01" />
+      <span>Pa·sⁿ</span>
+    </span>
+  </label>
+  <label>Flow index n
+    <input id="flowIndex" type="number" min="0.05" max="2" step="0.01" />
+  </label>
+</div>
+    </div>
+
     <canvas id="legend" width="256" height="1"></canvas>
     <div class="range"><span id="minLabel">0</span><span id="legendTitle"></span><span id="maxLabel"></span></div>
     <div id="flow"></div>
@@ -182,7 +249,27 @@ let geometryDirty = false;  // newer parameters arrived while it was in flight
 const geometryPayload = () => ({
     diameterRatio: state.pipeMm / state.wellboreMm,
     eccentricity: state.eccentricity,
-    roughness: state.roughnessPct / 100, // eps / D
+    roughness: state.roughnessPct / 100,
+
+    wellboreDiameterM: state.wellboreMm / 1000,
+
+    // Fixed frictional pressure gradient for the current fixed-drive model.
+    frictionGradientPaM: 1000,
+
+    // z points from inlet to outlet in the current display; define the sign
+    // according to the physical well direction used by your model.
+    gravityAlongAxisMSS: 0,
+
+    fluid: {
+        rheology: state.rheology,
+        densityKgM3: state.mudDensityKgM3,
+        viscosityPaS: state.viscosityPaS,
+        yieldStressPa: state.yieldStressPa,
+        plasticViscosityPaS: state.plasticViscosityPaS,
+        consistencyPaSn: state.consistencyPaSn,
+        flowIndex: state.flowIndex,
+        regularizationS: state.regularizationS,
+    },
 });
 
 function requestCompute() {
@@ -204,6 +291,67 @@ function requestGeometry() {
     geometryDirty = false;
     worker.postMessage({ type: 'SET_GEOMETRY', payload: geometryPayload() });
 }
+
+function syncFluidUi() {
+    $<HTMLSelectElement>('fluidBase').value = state.fluidBase;
+    $<HTMLSelectElement>('rheology').value = state.rheology;
+    $<HTMLInputElement>('mudDensity').value = String(state.mudDensityKgM3);
+
+    $<HTMLInputElement>('viscosity').value = String(state.viscosityPaS);
+    $<HTMLInputElement>('yieldStress').value = String(state.yieldStressPa);
+    $<HTMLInputElement>('plasticViscosity').value =
+        String(state.plasticViscosityPaS);
+
+    $<HTMLInputElement>('hbYieldStress').value =
+        String(state.yieldStressPa);
+    $<HTMLInputElement>('consistency').value =
+        String(state.consistencyPaSn);
+    $<HTMLInputElement>('flowIndex').value = String(state.flowIndex);
+
+    $('newtonianFields').hidden = state.rheology !== 'newtonian';
+    $('binghamFields').hidden = state.rheology !== 'bingham';
+    $('hbFields').hidden = state.rheology !== 'herschel-bulkley';
+}
+
+function bindFluidNumber(
+    id: string,
+    setValue: (value: number) => void,
+    min: number
+) {
+    $<HTMLInputElement>(id).addEventListener('change', (event) => {
+        const value = Number((event.target as HTMLInputElement).value);
+        if (!Number.isFinite(value) || value < min) {
+            syncFluidUi();
+            return;
+        }
+
+        setValue(value);
+        requestGeometry();
+    });
+}
+
+$<HTMLSelectElement>('fluidBase').addEventListener('change', (event) => {
+    state.fluidBase = (event.target as HTMLSelectElement).value as
+        typeof state.fluidBase;
+    requestGeometry();
+});
+
+$<HTMLSelectElement>('rheology').addEventListener('change', (event) => {
+    state.rheology = (event.target as HTMLSelectElement).value as
+        typeof state.rheology;
+    syncFluidUi();
+    requestGeometry();
+});
+
+bindFluidNumber('mudDensity', v => state.mudDensityKgM3 = v, 500);
+bindFluidNumber('viscosity', v => state.viscosityPaS = v, 1e-6);
+bindFluidNumber('yieldStress', v => state.yieldStressPa = v, 0);
+bindFluidNumber('plasticViscosity', v => state.plasticViscosityPaS = v, 1e-6);
+bindFluidNumber('hbYieldStress', v => state.yieldStressPa = v, 0);
+bindFluidNumber('consistency', v => state.consistencyPaSn = v, 1e-6);
+bindFluidNumber('flowIndex', v => state.flowIndex = v, 0.05);
+
+syncFluidUi();
 
 worker.onmessage = (e) => {
     const { type } = e.data;

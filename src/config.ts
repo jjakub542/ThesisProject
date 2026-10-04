@@ -28,6 +28,9 @@ export const PRESETS = [
     { label: '17½ × 6⅝ in', wellboreIn: 17.5, pipeIn: 6.625 },
 ];
 
+export type FluidBase = 'water' | 'oil';
+export type RheologyModel = 'newtonian' | 'bingham' | 'herschel-bulkley';
+
 /** Initial UI state. Diameters are stored in mm internally. */
 export const DEFAULTS = {
     wellboreMm: 8.5 * MM_PER_INCH,
@@ -39,6 +42,15 @@ export const DEFAULTS = {
     wellboreOpacity: 0.25,
     /** Effective wall roughness as % of wellbore diameter (0 = smooth reference). */
     roughnessPct: 0,
+    fluidBase: 'water' as FluidBase,
+    rheology: 'newtonian' as RheologyModel,
+    mudDensityKgM3: 1200,
+    viscosityPaS: 0.03,
+    yieldStressPa: 5,
+    consistencyPaSn: 0.5,
+    flowIndex: 0.8,
+    plasticViscosityPaS: 0.03,
+    regularizationS: 100,
 };
 
 export const DEFAULT_RATIO = DEFAULTS.pipeMm / DEFAULTS.wellboreMm;
